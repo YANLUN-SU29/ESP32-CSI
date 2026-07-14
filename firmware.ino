@@ -2,8 +2,8 @@
 #include <WiFiClient.h>
 #include "esp_wifi.h" 
 
-const char* ssid = "你的WIFI名稱";       // 例如："MERCUSYS_N300_CSI"
-const char* password = "你的WIFI密碼";   // 例如："12345678"
+const char* ssid = "WIFI CSI";
+const char* password = "Louis229";
 
 WiFiClient client;
 IPAddress gateway; // 用來自動儲存路由器的 IP

@@ -4,6 +4,21 @@
 本專案是一個輕量級的 Wi-Fi CSI (Channel State Information) 擷取與視覺化系統。
 透過 ESP32 開發板擷取 2.4GHz Wi-Fi (OFDM 52 條子載波) 的底層實體層訊號，並利用 Python 進行即時的 I/Q 複數解碼、環境去背與 2D 熱力圖視覺化，將無形的微波擾動轉化為肉眼可見的物理特徵。同時具備 CSV 自動錄影功能，可用於後續機器學習模型的資料收集。
 
+## 📁 專案結構
+```
+ESP32-CSI/
+├── data/                ← 錄製的 CSV 資料 (已被 .gitignore 排除)
+│   ├── CSI_Empty_Room_...csv
+│   ├── CSI_Walking_...csv
+│   └── CSI_Waving_...csv
+├── firmware.ino         ← ESP32 Arduino 韌體 (TCP 敲門版)
+├── monitor.py           ← Python 監控與視覺化主程式
+├── requirements.txt     ← Python 相依套件
+├── .gitignore           ← Git 忽略規則
+├── README.md            ← 專案說明 (本文件)
+└── TODO.md              ← 實驗室收案計畫
+```
+
 ## 🛠️ 硬體設備與環境
 *   **發射端 (Tx):** MERCUSYS N300 (MW302R) 路由器
     *   環境鎖定：Channel 6, 20MHz 頻寬。
@@ -31,3 +46,21 @@
    ```bash
    pip install -r requirements.txt
    ```
+2. 執行監控程式：
+   ```bash
+   # 互動模式（程式會問你要錄哪個動作）
+   python monitor.py
+
+   # 命令列模式（直接指定標籤）
+   python monitor.py Walking
+   ```
+3. 程式啟動後會自動掃描 COM Port 並連線 ESP32。
+4. 錄製的 CSV 資料會自動儲存至 `data/` 資料夾。
+5. 關閉視覺化視窗即可結束錄製，終端機會顯示錄製統計。
+
+### CSV 資料格式
+每個 CSV 檔案包含 53 欄：
+| 欄位 | 說明 |
+|------|------|
+| `Timestamp` | 錄製時間戳 (HH:MM:SS.mmm) |
+| `Sub_0` ~ `Sub_51` | 52 條子載波的真實振幅值 |
