@@ -12,7 +12,8 @@ ESP32-CSI/
 │   ├── CSI_Walking_...csv
 │   └── CSI_Waving_...csv
 ├── firmware.ino         ← ESP32 Arduino 韌體 (TCP 敲門版)
-├── monitor.py           ← Python 監控與視覺化主程式
+├── monitor.py           ← Python 即時監控與收案程式 (Online)
+├── analyzer_gui.py      ← Python 離線數據分析 GUI (Offline)
 ├── requirements.txt     ← Python 相依套件
 ├── .gitignore           ← Git 忽略規則
 ├── README.md            ← 專案說明 (本文件)
@@ -57,6 +58,19 @@ ESP32-CSI/
 3. 程式啟動後會自動掃描 COM Port 並連線 ESP32。
 4. 錄製的 CSV 資料會自動儲存至 `data/` 資料夾。
 5. 關閉視覺化視窗即可結束錄製，終端機會顯示錄製統計。
+
+### 3. 離線數據分析 (事後分析)
+錄製完成後，可使用 GUI 分析工具回顧任何 CSV 資料：
+```bash
+python analyzer_gui.py
+```
+開啟後點擊「選擇 CSV 檔案」即可載入，程式會自動繪製 4 張圖表：
+| 圖表 | 說明 |
+|------|------|
+| 1. Global Variance | 全域變異數，反映整體移動活躍程度 |
+| 2. 2D Spectrogram | 去背熱力圖，視覺化多徑效應波紋 |
+| 3. First 5 Subcarriers | 前 5 條子載波細節振幅 |
+| 4. All 52 Subcarriers | 全部 52 條子載波巨觀總覽 |
 
 ### CSV 資料格式
 每個 CSV 檔案包含 53 欄：
