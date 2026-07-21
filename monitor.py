@@ -28,7 +28,7 @@ else:
             break
         print("[錯誤] 輸入不能為空，請重新輸入。")
 
-BAUD_RATE = 115200
+BAUD_RATE = 921600
 SUBCARRIERS = 52
 WINDOW_SIZE = 100
 
