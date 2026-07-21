@@ -11,6 +11,9 @@ class CSIAnalyzerApp:
         self.root.title("CSI Offline Analyzer")
         self.root.geometry("1200x900")
 
+        # 綁定視窗關閉事件
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
         # 建立頂部控制面板
         top_frame = tk.Frame(root, bg="#2c3e50", pady=10)
         top_frame.pack(side=tk.TOP, fill=tk.X)
@@ -31,6 +34,12 @@ class CSIAnalyzerApp:
         # 加入工具列 (支援放大、縮小、存檔)
         self.toolbar = NavigationToolbar2Tk(self.canvas, root)
         self.toolbar.update()
+
+    def on_closing(self):
+        self.root.quit()
+        self.root.destroy()
+        import sys
+        sys.exit(0)
 
     def load_csv(self):
         filepath = filedialog.askopenfilename(

@@ -14,6 +14,7 @@ ESP32-CSI/
 ├── firmware.ino         ← ESP32 Arduino 韌體 (TCP 敲門版)
 ├── monitor.py           ← Python 即時監控與收案程式 (Online)
 ├── analyzer_gui.py      ← Python 離線數據分析 GUI (Offline)
+├── breathing_analyzer_gui.py ← Python 呼吸頻率分析 GUI (Offline)
 ├── requirements.txt     ← Python 相依套件
 ├── .gitignore           ← Git 忽略規則
 ├── README.md            ← 專案說明 (本文件)
@@ -71,6 +72,13 @@ python analyzer_gui.py
 | 2. 2D Spectrogram | 去背熱力圖，視覺化多徑效應波紋 |
 | 3. First 5 Subcarriers | 前 5 條子載波細節振幅 |
 | 4. All 52 Subcarriers | 全部 52 條子載波巨觀總覽 |
+
+### 4. 呼吸頻率分析 (進階分析)
+如果你錄製了人員靜止時的呼吸數據，可以使用專屬的呼吸分析工具：
+```bash
+python breathing_analyzer_gui.py
+```
+這支程式會自動過濾雜訊 (0.1~0.6 Hz 帶通濾波)，並透過 Welch 頻譜分析找出呼吸頻率 (峰值)，最後換算成每分鐘呼吸次數 (BPM)。
 
 ### CSV 資料格式
 每個 CSV 檔案包含 53 欄：
