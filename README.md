@@ -8,17 +8,17 @@
 ```
 ESP32-CSI/
 ├── data/                ← 錄製的 CSV 資料 (已被 .gitignore 排除)
-│   ├── CSI_Empty_Room_...csv
-│   ├── CSI_Walking_...csv
-│   └── CSI_Waving_...csv
+│   ├── CSI_Breath_Center_...csv
+│   ├── CSI_Walk_LoS_...csv
+│   ├── CSI_Apnea_Center_...csv
+│   └── ...
 ├── firmware.ino         ← ESP32 Arduino 韌體 (TCP 敲門版)
 ├── monitor.py           ← Python 即時監控與收案程式 (Online)
-├── analyzer_gui.py      ← Python 離線數據分析 GUI (Offline)
-├── breathing_analyzer_gui.py ← Python 呼吸頻率分析 GUI (Offline)
+├── analyzer_gui.py      ← Python 離線分析 GUI (含 PCA 融合 + 多模式特徵萃取)
 ├── requirements.txt     ← Python 相依套件
 ├── .gitignore           ← Git 忽略規則
 ├── README.md            ← 專案說明 (本文件)
-└── TODO.md              ← 實驗室收案計畫
+└── TODO.md              ← 開發路線圖
 ```
 
 ## 🛠️ 硬體設備與環境
@@ -35,6 +35,10 @@ ESP32-CSI/
     將 ESP32 輸出的原始交錯陣列 `[I1, Q1, I2, Q2...]`，透過畢氏定理 ($Amplitude = \sqrt{I^2 + Q^2}$) 轉換為真實距離振幅，消除未解碼時的馬賽克雜訊。
 3.  **動態背景消除演算法:**
     於 Python 端即時運算 `data_matrix - baseline`，消除環境中靜態物體（如牆壁、電腦機殼）的恆定微波反射，乾淨萃取出「人員移動」所產生的多徑效應 (Multipath Fading) 波紋。
+4.  **PCA 多載波融合:**
+    透過主成分分析 (PCA) 將 52 條子載波融合為單一 PC1 超級波形，大幅提升信噪比 (SNR)，取代依賴單一子載波的傳統做法。
+5.  **多層訊號清洗管線:**
+    Rolling MAD 離群值偵測 → 線性去趨勢 (Detrend) → Butterworth 帶通濾波，有效抑制 EMI 突波產生的「漣漪假象」。
 
 ## 🚀 使用方法
 
@@ -65,20 +69,19 @@ ESP32-CSI/
 ```bash
 python analyzer_gui.py
 ```
-開啟後點擊「選擇 CSV 檔案」即可載入，程式會自動繪製 4 張圖表：
-| 圖表 | 說明 |
-|------|------|
-| 1. Global Variance | 全域變異數，反映整體移動活躍程度 |
-| 2. 2D Spectrogram | 去背熱力圖，視覺化多徑效應波紋 |
-| 3. First 5 Subcarriers | 前 5 條子載波細節振幅 |
-| 4. All 52 Subcarriers | 全部 52 條子載波巨觀總覽 |
+開啟後點擊「載入 CSV 檔案」即可載入，程式提供 **4 種分析模式**透過 RadioButton 一鍵切換：
 
-### 4. 呼吸頻率分析 (進階分析)
-如果你錄製了人員靜止時的呼吸數據，可以使用專屬的呼吸分析工具：
-```bash
-python breathing_analyzer_gui.py
-```
-這支程式會自動過濾雜訊 (0.1~0.6 Hz 帶通濾波)，並透過 Welch 頻譜分析找出呼吸頻率 (峰值)，最後換算成每分鐘呼吸次數 (BPM)。
+| 模式 | 頻段 | 用途 |
+|------|------|------|
+| 大動作 | 0.05 ~ 5.0 Hz | 走動、起立坐下等肢體運動偵測 |
+| 呼吸 | 0.15 ~ 0.4 Hz | 靜止人員的微體徵 (呼吸) 萃取 |
+| 心跳 | 0.8 ~ 2.0 Hz | 極微體徵 (心跳) 偵測嘗試 |
+| 空房間基準 | 0.05 ~ 5.0 Hz | 確認無人時底噪是否平坦 |
+
+每次分析會顯示三層圖表：
+1. **52 條子載波全景疊加** — 觀察多徑衰落與整體變異
+2. **PCA 融合 + 基礎清理** — 送入 AI 前的真實訊號
+3. **目標特徵萃取** — 對應頻段的帶通濾波結果
 
 ### CSV 資料格式
 每個 CSV 檔案包含 53 欄：

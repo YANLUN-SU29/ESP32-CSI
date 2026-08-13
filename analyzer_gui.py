@@ -1,127 +1,154 @@
+import os
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from scipy.signal import detrend, butter, filtfilt
+from sklearn.decomposition import PCA
 
-class CSIAnalyzerApp:
+# 強制設定微軟正黑體與負號顯示
+plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei'] 
+plt.rcParams['axes.unicode_minus'] = False               
+
+class CSISpecificFeatureViewer_V3:
     def __init__(self, root):
         self.root = root
-        self.root.title("CSI Offline Analyzer")
-        self.root.geometry("1200x900")
+        self.root.title("CSI 物理特徵與 52 載波全景觀測器")
+        self.root.geometry("1200x850")
+        
+        self.csi_matrix = None
+        self.time_axis = None
+        self.fps = 60.9  
+        self.pc1_signal = None
+        
+        self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(3, 1, figsize=(10, 8))
+        self.fig.tight_layout(pad=4.0)
 
-        # 綁定視窗關閉事件
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.create_widgets()
 
-        # 建立頂部控制面板
-        top_frame = tk.Frame(root, bg="#2c3e50", pady=10)
-        top_frame.pack(side=tk.TOP, fill=tk.X)
+    def create_widgets(self):
+        control_frame = ttk.LabelFrame(self.root, text="操作面板", padding=(10, 10))
+        control_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        self.btn_load = tk.Button(top_frame, text="選擇 CSV 檔案", font=("Arial", 12, "bold"), 
-                                  bg="#3498db", fg="white", command=self.load_csv)
-        self.btn_load.pack(side=tk.LEFT, padx=20)
-
-        self.lbl_file = tk.Label(top_frame, text="請選擇要分析的 CSI 數據檔案...", 
-                                 font=("Arial", 12), bg="#2c3e50", fg="white")
+        # 1. 載入檔案
+        file_frame = ttk.Frame(control_frame)
+        file_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(file_frame, text="1. 載入 CSV 檔案", command=self.load_file).pack(side=tk.LEFT, padx=5)
+        self.lbl_file = ttk.Label(file_frame, text="尚未載入檔案...", foreground="blue")
         self.lbl_file.pack(side=tk.LEFT, padx=10)
 
-        # 建立 Matplotlib 畫布區塊
-        self.fig = plt.Figure(figsize=(12, 10))
-        self.canvas = FigureCanvasTkAgg(self.fig, master=root)
-        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        # 加入工具列 (支援放大、縮小、存檔)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, root)
-        self.toolbar.update()
-
-    def on_closing(self):
-        self.root.quit()
-        self.root.destroy()
-        import sys
-        sys.exit(0)
-
-    def load_csv(self):
-        filepath = filedialog.askopenfilename(
-            title="選擇 CSI 數據",
-            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
-        )
-        if not filepath:
-            return
+        # 2. 選擇特徵按鈕
+        filter_frame = ttk.Frame(control_frame)
+        filter_frame.pack(fill=tk.X, pady=10)
+        ttk.Label(filter_frame, text="2. 選擇你想驗證的目標特徵：", font=('Microsoft JhengHei', 10, 'bold')).pack(side=tk.LEFT, padx=5)
         
-        self.lbl_file.config(text=f"載入並分析中: {filepath.split('/')[-1]}...", fg="#f1c40f")
-        self.root.update()
+        self.var_mode = tk.StringVar(value="breath")
+        
+        rb1 = ttk.Radiobutton(filter_frame, text="大動作 (0.05~5.0 Hz)", variable=self.var_mode, value="walk", command=self.update_plot)
+        rb2 = ttk.Radiobutton(filter_frame, text="呼吸 (0.15~0.4 Hz)", variable=self.var_mode, value="breath", command=self.update_plot)
+        rb3 = ttk.Radiobutton(filter_frame, text="心跳 (0.8~2.0 Hz)", variable=self.var_mode, value="heart", command=self.update_plot)
+        rb4 = ttk.Radiobutton(filter_frame, text="空房間基準 (寬頻底噪)", variable=self.var_mode, value="empty", command=self.update_plot)
+        
+        rb1.pack(side=tk.LEFT, padx=10)
+        rb2.pack(side=tk.LEFT, padx=10)
+        rb3.pack(side=tk.LEFT, padx=10)
+        rb4.pack(side=tk.LEFT, padx=10)
 
+        # 圖表區
+        plot_frame = ttk.Frame(self.root)
+        plot_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def load_file(self):
+        filepath = filedialog.askopenfilename(title="選擇 CSI 錄製檔", filetypes=(("CSV Files", "*.csv"), ("All Files", "*.*")))
+        if not filepath: return
         try:
-            self.process_and_plot(filepath)
-            self.lbl_file.config(text=f"分析完成: {filepath.split('/')[-1]}", fg="#2ecc71")
+            df = pd.read_csv(filepath)
+            if 'Timestamp' in df.columns or df.columns[0].lower() == 'timestamp':
+                self.csi_matrix = df.iloc[:, 1:].values
+            else:
+                self.csi_matrix = df.values
+                
+            self.time_axis = np.arange(self.csi_matrix.shape[0]) / self.fps
+            self.lbl_file.config(text=f"已載入: {os.path.basename(filepath)} (共 {self.csi_matrix.shape[0]} 幀)")
+            
+            pca = PCA(n_components=1)
+            self.pc1_signal = pca.fit_transform(self.csi_matrix)[:, 0]
+            
+            if np.corrcoef(self.pc1_signal, self.csi_matrix[:, 20])[0, 1] < 0:
+                self.pc1_signal = -self.pc1_signal
+                
+            self.update_plot()
         except Exception as e:
-            messagebox.showerror("資料解析錯誤", f"無法讀取或繪製此檔案，請確認是否為標準 CSI CSV 格式。\n錯誤細節: {e}")
-            self.lbl_file.config(text="分析失敗", fg="#e74c3c")
+            messagebox.showerror("錯誤", f"無法載入檔案:\n{e}")
 
-    def process_and_plot(self, filepath):
-        # 1. 讀取資料
-        df = pd.read_csv(filepath)
-        sub_cols = [f'Sub_{i}' for i in range(52)]
+    def basic_clean(self, data):
+        s = pd.Series(data)
+        rmed = s.rolling(31, center=True).median()
+        rstd = s.rolling(31, center=True).std()
+        outliers = np.abs(s - rmed) > (3 * rstd)
+        s[outliers] = rmed[outliers]
+        clean_data = s.bfill().ffill().values
+        return detrend(clean_data, type='linear')
+
+    def update_plot(self):
+        if self.csi_matrix is None: return
+
+        base_signal = self.basic_clean(self.pc1_signal)
         
-        # 檢查欄位是否完整
-        if not all(col in df.columns for col in sub_cols):
-            raise ValueError("CSV 檔案缺少部分 Sub_X 欄位。")
+        mode = self.var_mode.get()
+        if mode == "walk":
+            lowcut, highcut = 0.05, 5.0
+            color, title_target = 'red', "大動作 (走動/起立坐下)"
+        elif mode == "breath":
+            lowcut, highcut = 0.15, 0.4
+            color, title_target = 'blue', "微體徵 (呼吸)"
+        elif mode == "heart":
+            lowcut, highcut = 0.8, 2.0
+            color, title_target = 'darkorange', "極微體徵 (心跳)"
+        elif mode == "empty":
+            # 空房間測試寬頻，確認沒有任何動作頻率的殘留
+            lowcut, highcut = 0.05, 5.0 
+            color, title_target = 'green', "空房間基準 (確認底噪平坦)"
 
-        data = df[sub_cols]
-        frames = df.index
+        b, a = butter(4, [lowcut / (self.fps/2), highcut / (self.fps/2)], btype='band')
+        target_signal = filtfilt(b, a, base_signal)
 
-        # 清除舊圖表，重新建立 4 個子圖 (共用 X 軸)
-        self.fig.clf()
-        self.axs = self.fig.subplots(4, 1, sharex=True)
-        
-        # -------------------------------------------------
-        # 圖表 1：全域變異數 (Global Variance - 移動靈敏度)
-        # -------------------------------------------------
-        rolling_var = data.var(axis=1).rolling(window=20, min_periods=1).mean()
-        self.axs[0].plot(frames, rolling_var, color='purple', linewidth=1.5)
-        self.axs[0].set_title("1. Global Variance Over Time (Movement Activity Level)", fontsize=10, fontweight='bold')
-        self.axs[0].set_ylabel("Variance")
-        self.axs[0].grid(True, linestyle='--', alpha=0.5)
+        self.ax1.clear(); self.ax2.clear(); self.ax3.clear()
 
-        # -------------------------------------------------
-        # 圖表 2：2D 動態熱力圖 (Background Subtracted)
-        # -------------------------------------------------
-        data_matrix = data.values.T
-        baseline = np.mean(data_matrix, axis=1, keepdims=True)
-        dynamic_data = data_matrix - baseline
-        
-        im = self.axs[1].imshow(dynamic_data, aspect='auto', cmap='jet', vmin=-15, vmax=15, origin='lower')
-        self.axs[1].set_title("2. 2D CSI Spectrogram (Background Subtracted)", fontsize=10, fontweight='bold')
-        self.axs[1].set_ylabel("Subcarrier")
-        cbar = self.fig.colorbar(im, ax=self.axs[1], fraction=0.046, pad=0.01)
-        cbar.set_label('Fluctuation')
+        # 1. 繪製 52 條全景子載波
+        for i in range(self.csi_matrix.shape[1]):
+            self.ax1.plot(self.time_axis, self.csi_matrix[:, i], color='gray', alpha=0.3, linewidth=0.5)
+        # 用粗黑線突顯 Sub_20，方便對照
+        self.ax1.plot(self.time_axis, self.csi_matrix[:, 20], color='black', alpha=0.8, linewidth=1.5, label='Sub_20')
+        self.ax1.set_title("1. 全景 52 條子載波 (疊加) - 觀察空間多徑衰落與整體變異", fontsize=10)
+        self.ax1.set_ylabel("Amplitude")
+        self.ax1.set_xlim(0, self.time_axis[-1])
+        self.ax1.legend(loc='upper right')
 
-        # -------------------------------------------------
-        # 圖表 3：前 5 條子載波 (First 5 Subcarriers)
-        # -------------------------------------------------
-        for col in sub_cols[:5]:
-            self.axs[2].plot(frames, data[col], label=col, alpha=0.8)
-        self.axs[2].set_title("3. Amplitude of First 5 Subcarriers (Detailed View)", fontsize=10, fontweight='bold')
-        self.axs[2].set_ylabel("Amplitude")
-        self.axs[2].legend(loc='upper right', fontsize='small')
-        self.axs[2].grid(True, linestyle='--', alpha=0.5)
+        # 2. PCA 融合
+        self.ax2.plot(self.time_axis, base_signal, color='gray', linewidth=1)
+        self.ax2.set_title("2. PCA 融合 + 基礎清理 (無濾除特定頻率，此為送入 AI 之真實訊號)", fontsize=10)
+        self.ax2.set_ylabel("PC1 Cleaned")
+        self.ax2.set_xlim(0, self.time_axis[-1])
 
-        # -------------------------------------------------
-        # 圖表 4：全部 52 條子載波 (All 52 Subcarriers)
-        # -------------------------------------------------
-        for col in sub_cols:
-            self.axs[3].plot(frames, data[col], alpha=0.2) # 使用低透明度避免線條互相掩蓋
-        self.axs[3].set_title("4. Amplitude of All 52 Subcarriers (Macroscopic View)", fontsize=10, fontweight='bold')
-        self.axs[3].set_ylabel("Amplitude")
-        self.axs[3].set_xlabel("Frame (Time)")
-        self.axs[3].grid(True, linestyle='--', alpha=0.5)
+        # 3. 目標特徵萃取
+        self.ax3.plot(self.time_axis, target_signal, color=color, linewidth=2)
+        self.ax3.set_title(f"3. 專屬特徵萃取：{title_target} ({lowcut} ~ {highcut} Hz)", fontsize=12, fontweight='bold')
+        self.ax3.set_xlabel("Time (Seconds)")
+        self.ax3.set_ylabel("Filtered Value")
+        self.ax3.set_xlim(0, self.time_axis[-1])
 
-        # 調整版面與繪製
-        self.fig.tight_layout()
+        for ax in [self.ax1, self.ax2, self.ax3]:
+            ax.grid(True, linestyle='--', alpha=0.6)
+
+        self.fig.tight_layout(pad=4.0)
         self.canvas.draw()
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = CSIAnalyzerApp(root)
+    app = CSISpecificFeatureViewer_V3(root)
     root.mainloop()
