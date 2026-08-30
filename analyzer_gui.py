@@ -67,20 +67,36 @@ class CSISpecificFeatureViewer_V3:
         if not filepath: return
         try:
             df = pd.read_csv(filepath)
-            if 'Timestamp' in df.columns or df.columns[0].lower() == 'timestamp':
+            has_timestamp = 'Timestamp' in df.columns or df.columns[0].lower() == 'timestamp'
+            if has_timestamp:
                 self.csi_matrix = df.iloc[:, 1:].values
+                timestamps = pd.to_datetime(df.iloc[:, 0], format='%H:%M:%S.%f')
+                self.time_axis = (timestamps - timestamps.iloc[0]).dt.total_seconds().values
+                # 用整段錄製的「總幀數/總時長」估計平均 fps；不用逐筆間隔的中位數，
+                # 因為 monitor.py 是一次把序列埠緩衝區讀乾，樣本到達本來就是一陣一陣的
+                # （相鄰間隔常只有 6~9ms），逐筆中位數會被這種陣發性拉低、失真。
+                duration = self.time_axis[-1]
+                if duration > 0:
+                    self.fps = (len(self.time_axis) - 1) / duration
             else:
                 self.csi_matrix = df.values
-                
-            self.time_axis = np.arange(self.csi_matrix.shape[0]) / self.fps
-            self.lbl_file.config(text=f"已載入: {os.path.basename(filepath)} (共 {self.csi_matrix.shape[0]} 幀)")
-            
+                self.time_axis = np.arange(self.csi_matrix.shape[0]) / self.fps
+
+            self.lbl_file.config(
+                text=f"已載入: {os.path.basename(filepath)} "
+                     f"(共 {self.csi_matrix.shape[0]} 幀, 實測 {self.fps:.1f} fps, "
+                     f"時長 {self.time_axis[-1]:.1f}s)"
+            )
+
+            # 剔除全程為 0 的子載波（ESP32 HT20 CSI 的 null/guard 子載波），避免稀釋 PCA 融合
+            nonzero_mask = ~np.all(self.csi_matrix == 0, axis=0)
             pca = PCA(n_components=1)
-            self.pc1_signal = pca.fit_transform(self.csi_matrix)[:, 0]
-            
-            if np.corrcoef(self.pc1_signal, self.csi_matrix[:, 20])[0, 1] < 0:
+            self.pc1_signal = pca.fit_transform(self.csi_matrix[:, nonzero_mask])[:, 0]
+
+            ref_idx = 20 if self.csi_matrix.shape[1] > 20 else 0
+            if np.corrcoef(self.pc1_signal, self.csi_matrix[:, ref_idx])[0, 1] < 0:
                 self.pc1_signal = -self.pc1_signal
-                
+
             self.update_plot()
         except Exception as e:
             messagebox.showerror("錯誤", f"無法載入檔案:\n{e}")
