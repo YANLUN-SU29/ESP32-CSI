@@ -7,6 +7,7 @@ import csv
 import datetime
 import os
 import sys
+import time
 
 # ----------------- [動態標籤輸入] -----------------
 VALID_LABELS = ["Empty_Room", "Walking", "Waving"]
@@ -31,6 +32,7 @@ else:
 BAUD_RATE = 921600
 SUBCARRIERS = 52
 WINDOW_SIZE = 100
+GAP_WARN_THRESHOLD = 0.5  # 秒；相鄰兩筆樣本間隔超過此值視為訊號斷點
 
 print(f"\n[啟動] Wi-Fi 雷達 (CSV 錄製模式：{ACTION_LABEL} / 動態 COM 版)...")
 
@@ -76,6 +78,8 @@ print(f"[錄製] CSV 輸出路徑：{filename}")
 data_matrix = np.zeros((SUBCARRIERS, WINDOW_SIZE))
 record_count = 0
 error_count = 0
+gap_count = 0
+last_sample_time = None
 
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
@@ -107,7 +111,7 @@ fig.colorbar(cax, ax=ax2, label="Amplitude Fluctuation")
 
 # ----------------- [資料更新邏輯] -----------------
 def update(frame):
-    global data_matrix, record_count, error_count
+    global data_matrix, record_count, error_count, gap_count, last_sample_time
     updated = False
 
     while ser.in_waiting > 0:
@@ -126,8 +130,17 @@ def update(frame):
                 if len(amplitudes) >= (SUBCARRIERS + OFFSET):
                     clean_52_subcarriers = amplitudes[OFFSET : OFFSET+SUBCARRIERS]
 
+                    # 即時偵測訊號斷點（例如 Wi-Fi/TCP 重連導致的資料空窗）
+                    now = time.perf_counter()
+                    if last_sample_time is not None:
+                        gap = now - last_sample_time
+                        if gap > GAP_WARN_THRESHOLD:
+                            gap_count += 1
+                            print(f"[警告] 偵測到訊號斷點：{gap:.2f}s（發生於第 {record_count + 1} 筆之前）")
+                    last_sample_time = now
+
                     # CSV 寫入（常駐 file handle，定期 flush）
-                    timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                    timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')
                     csv_writer.writerow([timestamp] + clean_52_subcarriers)
                     record_count += 1
                     if record_count % 50 == 0:
@@ -160,7 +173,7 @@ def update(frame):
 
         # 即時計數器顯示於視窗標題
         fig.canvas.manager.set_window_title(
-            f"CSI Monitor - {ACTION_LABEL} | 已錄製 {record_count} 筆 | 丟棄 {error_count} 筆"
+            f"CSI Monitor - {ACTION_LABEL} | 已錄製 {record_count} 筆 | 丟棄 {error_count} 筆 | 斷點 {gap_count} 次"
         )
 
     return lines + [cax]
@@ -179,4 +192,5 @@ finally:
     print(f"\n[結束] 觀測結束。")
     print(f"  - 有效錄製：{record_count} 筆")
     print(f"  - 解析丟棄：{error_count} 筆")
+    print(f"  - 訊號斷點：{gap_count} 次（單次間隔 > {GAP_WARN_THRESHOLD}s）")
     print(f"  - 儲存位置：{filename}")

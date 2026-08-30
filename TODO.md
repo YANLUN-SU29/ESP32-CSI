@@ -18,6 +18,7 @@
 - [x] 驗證呼吸偵測：Welch PSD 可抓到 0.15~0.4 Hz 峰值。
 - [x] 驗證心跳偵測：0.8~2.0 Hz 帶通濾波可觀察到微弱訊號。
 - [x] 優化 analyzer_gui.py：改用實際 Timestamp 換算 fps（取代固定假設值），並於 PCA 融合前剔除全零的 null/guard 子載波。
+- [x] 優化 monitor.py：Timestamp 改為微秒精度（減少重複時間戳），並新增即時訊號斷點偵測與警告。
 
 ## 🟡 階段三：進階分析與 AI 建模 (進行中)
 - [ ] 整合 CWT (連續小波變換) 生成時頻譜圖 (Scalogram)。
