@@ -171,7 +171,19 @@ class CSIFeatureViewer:
             df = pd.read_csv(filepath)
             has_ts = 'Timestamp' in df.columns or df.columns[0].lower() == 'timestamp'
             if has_ts:
-                csi = df.iloc[:, 1:].values.astype(float)
+                # 若檔案含相位欄（_P 後綴），只取振幅欄（_A）。
+                # 相位的物理意義與尺度都和振幅不同，混進同一個 PCA 會破壞融合結果。
+                # 舊格式（Sub_0.. 或 L1..）沒有後綴，則全部視為振幅。
+                data_cols = list(df.columns[1:])
+                phase_cols = [c for c in data_cols if str(c).endswith('_P')]
+                if phase_cols:
+                    amp_cols = [c for c in data_cols if str(c).endswith('_A')]
+                    self.has_phase = True
+                else:
+                    amp_cols = data_cols
+                    self.has_phase = False
+                self.amp_col_names = amp_cols
+                csi = df[amp_cols].values.astype(float)
                 # 舊版錄製為毫秒、新版為微秒，%f 兩者皆可解析
                 ts = pd.to_datetime(df.iloc[:, 0], format='%H:%M:%S.%f')
                 time_axis = (ts - ts.iloc[0]).dt.total_seconds().values
@@ -181,6 +193,8 @@ class CSIFeatureViewer:
                 fps = (len(time_axis) - 1) / duration if duration > 0 else self.fps
             else:
                 csi = df.values.astype(float)
+                self.has_phase = False
+                self.amp_col_names = list(df.columns)
                 fps = self.fps
                 time_axis = np.arange(csi.shape[0]) / fps
 
@@ -238,7 +252,8 @@ class CSIFeatureViewer:
             text=f"已載入: {os.path.basename(self.filepath)} "
                  f"({self.csi_matrix.shape[0]} 幀 / {self.time_axis[-1]:.1f}s / "
                  f"實測 {self.fps:.1f} fps / 有效載波 {self.clean_matrix.shape[1]}"
-                 f"{f'，剔除全零 {dropped} 條' if dropped else ''})")
+                 f"{f'，剔除全零 {dropped} 條' if dropped else ''}"
+                 f"{'，含相位欄（分析僅用振幅）' if getattr(self, 'has_phase', False) else ''})")
         self.lbl_status.config(text="就緒")
         self.update_plot()
 
@@ -320,6 +335,14 @@ class CSIFeatureViewer:
         return psd / med if med > 0 else psd
 
     # ---------------------------------------------------------------- 繪圖 --
+    def _sub_label(self, j):
+        """把 clean_matrix 的欄索引換成可讀的子載波名稱（如 L39_A / Sub_20）。"""
+        names = getattr(self, 'amp_col_names', None)
+        idx = int(self.sub_index[j])
+        if names and idx < len(names):
+            return str(names[idx])
+        return f"Sub_{idx}"
+
     def _decimate(self, y):
         n = len(y)
         if n <= PLOT_MAX_POINTS:
@@ -352,7 +375,7 @@ class CSIFeatureViewer:
             best = self.sub_index[stats['best']]
             t, y = self._decimate(self.csi_matrix[:, best])
             self.ax1.plot(t, y, color='black', alpha=0.85, linewidth=1.4,
-                          label=f'Sub_{best}（該頻段最強）')
+                          label=f"{self._sub_label(stats['best'])}（該頻段最強）")
             self.ax1.legend(loc='upper right', fontsize=8)
         self.ax1.set_title(f"1. 全景 {self.clean_matrix.shape[1]} 條有效子載波 — 觀察多徑衰落與整體變異",
                            fontsize=10)
@@ -375,10 +398,10 @@ class CSIFeatureViewer:
         self.ax3.semilogy(f_fused, self._normalise(p_fused, f_fused, band),
                           color='gray', linewidth=0.9, alpha=0.75, label='融合訊號')
         if stats is not None:
-            best = self.sub_index[stats['best']]
             self.ax3.semilogy(self.sub_freqs,
                               self._normalise(self.sub_psd[:, stats['best']], self.sub_freqs, band),
-                              color=color, linewidth=1.3, label=f'Sub_{best}（判定依據）')
+                              color=color, linewidth=1.3,
+                              label=f"{self._sub_label(stats['best'])}（判定依據）")
             self.ax3.axvline(stats['freq'], color=color, linestyle='--', linewidth=1.4,
                              label=f"共識峰值 {stats['freq']:.3f} Hz ({stats['freq']*60:.1f}/分)")
         self.ax3.axhline(1.0, color='gray', linewidth=0.8, alpha=0.6)

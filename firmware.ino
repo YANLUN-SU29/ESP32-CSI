@@ -3,6 +3,8 @@
 #include "esp_wifi.h"
 #include "ping/ping_sock.h"
 #include "lwip/ip_addr.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 
 const char* ssid = "WIFI CSI";
@@ -27,34 +29,77 @@ bool tcp_connected = false; // TCP 連線狀態旗標
 esp_ping_handle_t ping_handle = NULL;
 
 
-// CSI 中斷回呼函式 (sprintf 整行輸出版)
+// ===== CSI 事件佇列 =====
+// 原本在 CSI 回呼裡直接 Serial.println。該回呼跑在 Wi-Fi driver task 的 context，
+// 阻塞式序列埠寫入（一行約 490 bytes、@921600 baud 需 ~5ms）會卡住該任務，
+// 導致 Wi-Fi 驅動不再把後續 CSI 事件送進來——而且這種「事件根本沒進到回呼」的
+// 損失在 PC 端完全偵測不到，連計數器都測不出來。
+//
+// 改成：回呼只負責把資料丟進佇列（非阻塞），由 loop() 排空並輸出。
+// 佇列滿代表序列埠追不上，此時明確計數為 queue_full_drop——損失變成可量測的數字。
+#define CSI_MAX_LEN   384   // 目前設定下 HT20 為 256 bytes，留些餘裕
+#define CSI_QUEUE_LEN 24    // 24 * ~392 bytes ≈ 9.4KB
+
+typedef struct {
+  uint32_t seq;       // 單調遞增序號，PC 端可據此偵測傳輸中遺失的行
+  uint16_t len;
+  int8_t   rssi;
+  uint8_t  sig_mode;
+  int8_t   buf[CSI_MAX_LEN];
+} csi_item_t;
+
+QueueHandle_t csi_queue = NULL;
+
+// 這些計數器由回呼（Wi-Fi task）寫入、loop 讀取，故標為 volatile
+volatile uint32_t csi_seq          = 0;  // 進入回呼且通過長度檢查的事件總數
+volatile uint32_t queue_full_drop  = 0;  // 因佇列滿而丟棄（序列埠追不上）
+volatile uint32_t oversize_drop    = 0;  // 因長度異常而丟棄
+
+
+// CSI 回呼：只做最小工作量，絕不阻塞
 void _wifi_csi_cb(void *ctx, wifi_csi_info_t *data) {
-  int8_t *csi_buf = data->buf;
   uint16_t len = data->len;
 
-
-  // 【修改 1：加大紙箱】把原本的 1024 加大到 4096，避免被路由器的大封包塞爆
-  static char line_buf[4096];
-
-  // 【修改 2：安全氣囊】如果封包長度異常大，直接丟棄保護晶片不當機
-  if (len > 512) return;
-
-
-  // 【修改 3】輸出中繼資料：
-  //   len      = 原始 CSI 位元組數，PC 端才能確認子載波佈局、並剔除長度不一致的封包
-  //              （長度若在 128/256/384 之間跳動，同一個陣列索引在不同幀會代表不同的實體子載波）
-  //   rssi     = 訊號強度，用於診斷連線品質
-  //   sig_mode = 0:非HT(11b/g) 1:HT(11n)，決定 CSI 內容是 LLTF 還是含 HT-LTF
-  //   行首改用 CSI_V2 以便 PC 端明確區分新舊格式
-  int pos = 0;
-  pos += sprintf(line_buf + pos, "CSI_V2,%u,%d,%u",
-                 (unsigned)len, (int)data->rx_ctrl.rssi, (unsigned)data->rx_ctrl.sig_mode);
-  for (int i = 0; i < len; i++) {
-    pos += sprintf(line_buf + pos, ",%d", csi_buf[i]);
+  // 長度異常直接丟棄，保護晶片不當機
+  if (len == 0 || len > CSI_MAX_LEN) {
+    oversize_drop++;
+    return;
   }
 
+  csi_item_t item;
+  item.seq      = ++csi_seq;
+  item.len      = len;
+  item.rssi     = data->rx_ctrl.rssi;
+  item.sig_mode = data->rx_ctrl.sig_mode;
+  memcpy(item.buf, data->buf, len);
 
-  Serial.println(line_buf);
+  // 逾時 0：佇列滿就立刻放棄並計數，絕不在此等待
+  if (xQueueSend(csi_queue, &item, 0) != pdTRUE) {
+    queue_full_drop++;
+  }
+}
+
+
+// 由 loop() 呼叫，把佇列內的 CSI 格式化後輸出
+// 行格式：CSI_V3,<seq>,<len>,<rssi>,<sig_mode>,<dropped>,<csi...>
+//   seq     = 事件序號，PC 端比對跳號即知傳輸中遺失了幾行
+//   dropped = ESP32 端累計丟棄數（佇列滿 + 長度異常），讓 PC 端直接看到丟失率
+void drain_csi_queue() {
+  static char line_buf[4096];
+  csi_item_t item;
+
+  while (xQueueReceive(csi_queue, &item, 0) == pdTRUE) {
+    uint32_t dropped = queue_full_drop + oversize_drop;
+    int pos = 0;
+    pos += sprintf(line_buf + pos, "CSI_V3,%lu,%u,%d,%u,%lu",
+                   (unsigned long)item.seq, (unsigned)item.len,
+                   (int)item.rssi, (unsigned)item.sig_mode,
+                   (unsigned long)dropped);
+    for (int i = 0; i < item.len; i++) {
+      pos += sprintf(line_buf + pos, ",%d", item.buf[i]);
+    }
+    Serial.println(line_buf);
+  }
 }
 
 
@@ -138,6 +183,17 @@ void setup() {
       .shift             = false,
   };
   ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
+
+  // 佇列必須在註冊回呼之前建好，否則第一個事件就會寫到 NULL
+  csi_queue = xQueueCreate(CSI_QUEUE_LEN, sizeof(csi_item_t));
+  if (csi_queue == NULL) {
+    Serial.println("[Error] CSI 佇列建立失敗（記憶體不足）");
+    while (true) delay(1000);
+  }
+  Serial.printf("[Queue] CSI 佇列 %d 筆 x %u bytes = %u bytes\n",
+                CSI_QUEUE_LEN, (unsigned)sizeof(csi_item_t),
+                (unsigned)(CSI_QUEUE_LEN * sizeof(csi_item_t)));
+
   ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(&_wifi_csi_cb, NULL));
 
 #if USE_ICMP_PING
@@ -150,23 +206,25 @@ void setup() {
 
 
 void loop() {
-#if USE_ICMP_PING
-  // ping 由 esp_ping 的背景任務持續發送，loop 只需監看 Wi-Fi 是否掉線
+  // 每輪先盡量排空 CSI 佇列。這是 loop 最重要的工作——排得不夠快佇列就會滿，
+  // 進而累加 queue_full_drop。原本的 delay(10) 會讓 loop 有 10ms 完全不排空，
+  // 故改用 millis() 排程敲門，不再阻塞。
+  drain_csi_queue();
+
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WiFi] 連線中斷，重新連線...");
     WiFi.reconnect();
-    delay(500);
+    return;
   }
-  delay(200);
 
-#else
+#if !USE_ICMP_PING
   // TCP 常駐連線：只在斷線時才重新建立
   // 第三個參數是連線逾時 (ms)。預設逾時可長達數秒，期間 loop() 被卡住、
   // 敲門封包停發、CSI 就斷流——實測 201 秒錄製出現 9 次中斷（最長 613ms）。
   // 壓成 500ms 可把單次卡頓上限鎖住。
   if (!client.connected()) {
     if (client.connect(gateway, 80, 500)) {
-      // 【新增這行神功】：關閉 TCP 緩衝延遲，封包隨發隨至，減少卡頓！
+      // 關閉 TCP 緩衝延遲，封包隨發隨至，減少卡頓
       client.setNoDelay(true);
       tcp_connected = true;
     } else {
@@ -174,16 +232,18 @@ void loop() {
     }
   }
 
-
-  // 送一個最小封包保活，觸發路由器回傳單播封包
-  if (tcp_connected && client.connected()) {
-    // 稍微改一下，送一個空白鍵加換行，稍微騙一下路由器這是一個正常的文字
-    client.print(" \r\n");
-  } else {
-    // 連線失敗，重置旗標，下一輪重連
-    tcp_connected = false;
+  // 每 10ms 送一個最小封包保活，觸發路由器回傳單播封包
+  static uint32_t last_knock = 0;
+  if (millis() - last_knock >= 10) {
+    last_knock = millis();
+    if (tcp_connected && client.connected()) {
+      client.print(" \r\n");
+    } else {
+      tcp_connected = false;
+    }
   }
-
-  delay(10);
 #endif
+
+  // 讓出 1 tick 給其他任務（含 Wi-Fi 任務），但不長時間阻塞排空工作
+  vTaskDelay(1);
 }
