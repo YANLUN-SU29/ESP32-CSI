@@ -30,9 +30,30 @@ else:
         print("[錯誤] 輸入不能為空，請重新輸入。")
 
 BAUD_RATE = 921600
-SUBCARRIERS = 52
 WINDOW_SIZE = 100
 GAP_WARN_THRESHOLD = 0.5  # 秒；相鄰兩筆樣本間隔超過此值視為訊號斷點
+
+# ----------------- [子載波擷取佈局] -----------------
+# 韌體實測送出 384 bytes = 192 條子載波，由三個 64 條的區塊組成：
+#   振幅索引   0~ 63  LLTF          （DC 在 0，保護頻帶 28~36）
+#   振幅索引  64~127  HT-LTF        （DC 在 64，保護頻帶 93~99）
+#   振幅索引 128~191  STBC-HT-LTF2  （DC 在 128，保護頻帶 157~163）
+#
+# 取捨依據（以 600 筆實測 + 30 筆標註資料驗證）：
+#   - 各區塊第 0 條是 DC 離群值（LLTF 為 134.4，區塊中位數僅 17.6），非真實通道，剔除。
+#   - STBC-HT-LTF2 與 HT-LTF 的逐條時間序列相關係數中位數 0.902，屬冗餘，
+#     納入只會讓 PCA 對重複方向加倍加權，故捨棄。
+#   - HT-LTF 與 LLTF 相關性僅 0.06，是獨立的通道量測，值得納入。
+#
+# 舊版寫死 amplitudes[5:57]，等於存了 9 條恆為零的保護頻帶，
+# 又把視窗兩端切在滿振幅上（漏掉 LLTF 的 1~4 與 57~63 共 11 條）。
+LLTF_IDX = list(range(1, 28)) + list(range(37, 64))       # 54 條
+HTLTF_IDX = list(range(65, 93)) + list(range(100, 128))   # 56 條
+SUBCARRIER_IDX = LLTF_IDX + HTLTF_IDX                     # 110 條
+SUBCARRIERS = len(SUBCARRIER_IDX)
+REQUIRED_AMPS = max(SUBCARRIER_IDX) + 1                   # 需要至少 128 條振幅（即 len=256 以上）
+# 欄位名稱直接標出區塊與原始振幅索引，讓資料自我描述
+COLUMN_NAMES = [f"L{i}" for i in LLTF_IDX] + [f"H{i}" for i in HTLTF_IDX]
 
 print(f"\n[啟動] Wi-Fi 雷達 (CSV 錄製模式：{ACTION_LABEL} / 動態 COM 版)...")
 
@@ -70,7 +91,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 filename = os.path.join(DATA_DIR, f"CSI_{ACTION_LABEL}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 csv_file = open(filename, 'w', newline='')
 csv_writer = csv.writer(csv_file)
-csv_writer.writerow(['Timestamp'] + [f'Sub_{i}' for i in range(SUBCARRIERS)])
+csv_writer.writerow(['Timestamp'] + COLUMN_NAMES)
 
 print(f"[錄製] CSV 輸出路徑：{filename}")
 
@@ -79,7 +100,14 @@ data_matrix = np.zeros((SUBCARRIERS, WINDOW_SIZE))
 record_count = 0
 error_count = 0
 gap_count = 0
+layout_skip = 0       # 因長度不符預期佈局而丟棄的幀數
 last_sample_time = None
+
+# 韌體 CSI_V2 格式帶回的中繼資料統計（用於確認子載波佈局與連線品質）
+len_stats = {}        # 原始 CSI 位元組數 -> 出現次數
+sig_mode_stats = {}   # 0:非HT(11b/g) 1:HT(11n) -> 出現次數
+rssi_samples = []
+meta_reported = False
 
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
@@ -92,7 +120,8 @@ except Exception as e:
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [1, 1.5]})
 fig.tight_layout(pad=4.0)
 
-ax1.set_title(f"52 Subcarriers True Amplitude (Recording: {ACTION_LABEL})")
+ax1.set_title(f"{SUBCARRIERS} Subcarriers True Amplitude "
+              f"(LLTF {len(LLTF_IDX)} + HT-LTF {len(HTLTF_IDX)}) — Recording: {ACTION_LABEL}")
 ax1.set_xlim(0, WINDOW_SIZE)
 ax1.set_ylim(0, 100)
 ax1.set_ylabel("Amplitude")
@@ -105,30 +134,60 @@ for i in range(SUBCARRIERS):
 
 cax = ax2.imshow(data_matrix, aspect='auto', cmap='jet', vmin=-15, vmax=15)
 ax2.set_title("2D CSI Spectrogram (Background Subtracted)")
-ax2.set_ylabel("Subcarrier (0-51)")
+ax2.set_ylabel(f"Subcarrier (0-{SUBCARRIERS-1}: LLTF then HT-LTF)")
 ax2.set_xlabel("Time (Frames)")
 fig.colorbar(cax, ax=ax2, label="Amplitude Fluctuation")
 
 # ----------------- [資料更新邏輯] -----------------
 def update(frame):
     global data_matrix, record_count, error_count, gap_count, last_sample_time
+    global meta_reported, layout_skip
     updated = False
 
     while ser.in_waiting > 0:
         try:
             raw_data = ser.readline().decode('utf-8').strip()
-            if raw_data.startswith("CSI_DATA"):
-                parts = raw_data.split(',')[1:]
-                csi_numbers = [int(x) for x in parts if x.strip() != ""]
+            if raw_data.startswith("CSI_V2") or raw_data.startswith("CSI_DATA"):
+                tokens = raw_data.split(',')
+
+                if tokens[0] == "CSI_V2":
+                    # 新格式：CSI_V2,<len>,<rssi>,<sig_mode>,<csi...>
+                    declared_len = int(tokens[1])
+                    rssi = int(tokens[2])
+                    sig_mode = int(tokens[3])
+                    csi_numbers = [int(x) for x in tokens[4:] if x.strip() != ""]
+
+                    # 長度與宣告不符代表該行被截斷（序列埠壅塞），整幀丟棄
+                    if len(csi_numbers) != declared_len:
+                        raise ValueError(
+                            f"CSI 長度不符：宣告 {declared_len}，實得 {len(csi_numbers)}")
+
+                    len_stats[declared_len] = len_stats.get(declared_len, 0) + 1
+                    sig_mode_stats[sig_mode] = sig_mode_stats.get(sig_mode, 0) + 1
+                    rssi_samples.append(rssi)
+
+                    if not meta_reported:
+                        meta_reported = True
+                        mode_name = "非HT (11b/g)" if sig_mode == 0 else "HT (11n)"
+                        print(f"[韌體] CSI_V2 格式 | 原始長度 {declared_len} bytes "
+                              f"({declared_len // 2} 條子載波) | RSSI {rssi} dBm | {mode_name}")
+                        print(f"[擷取] LLTF {len(LLTF_IDX)} 條 + HT-LTF {len(HTLTF_IDX)} 條 "
+                              f"= {SUBCARRIERS} 條（已剔除 DC 與保護頻帶，捨棄冗餘的 STBC 區塊）")
+                else:
+                    # 舊格式：CSI_DATA,<csi...>
+                    csi_numbers = [int(x) for x in tokens[1:] if x.strip() != ""]
 
                 amplitudes = []
                 for i in range(0, len(csi_numbers)-1, 2):
                     amp = np.sqrt(csi_numbers[i]**2 + csi_numbers[i+1]**2)
                     amplitudes.append(amp)
 
-                OFFSET = 5
-                if len(amplitudes) >= (SUBCARRIERS + OFFSET):
-                    clean_52_subcarriers = amplitudes[OFFSET : OFFSET+SUBCARRIERS]
+                if len(amplitudes) < REQUIRED_AMPS:
+                    # 長度不足代表這幀不是預期的三區塊佈局（例如非 HT 封包只有 LLTF），
+                    # 若照樣取索引會取到不存在或對應錯誤的子載波，故整幀丟棄。
+                    layout_skip += 1
+                else:
+                    selected = [amplitudes[i] for i in SUBCARRIER_IDX]
 
                     # 即時偵測訊號斷點（例如 Wi-Fi/TCP 重連導致的資料空窗）
                     now = time.perf_counter()
@@ -141,14 +200,14 @@ def update(frame):
 
                     # CSV 寫入（常駐 file handle，定期 flush）
                     timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')
-                    csv_writer.writerow([timestamp] + clean_52_subcarriers)
+                    csv_writer.writerow([timestamp] + selected)
                     record_count += 1
                     if record_count % 50 == 0:
                         csv_file.flush()
 
                     # 環形緩衝區更新（避免 hstack 重新分配記憶體）
                     data_matrix = np.roll(data_matrix, -1, axis=1)
-                    data_matrix[:, -1] = clean_52_subcarriers
+                    data_matrix[:, -1] = selected
                     updated = True
         except Exception as e:
             error_count += 1
@@ -193,4 +252,21 @@ finally:
     print(f"  - 有效錄製：{record_count} 筆")
     print(f"  - 解析丟棄：{error_count} 筆")
     print(f"  - 訊號斷點：{gap_count} 次（單次間隔 > {GAP_WARN_THRESHOLD}s）")
+    if layout_skip:
+        print(f"  - 佈局不符丟棄：{layout_skip} 筆（振幅數不足 {REQUIRED_AMPS}，"
+              f"多為非 HT 封包只含 LLTF）")
+    if len_stats:
+        total = sum(len_stats.values())
+        print(f"  - CSI 原始長度分布：")
+        for L, c in sorted(len_stats.items(), key=lambda x: -x[1]):
+            print(f"      {L} bytes ({L // 2} 條子載波)：{c} 筆 ({c / total * 100:.1f}%)")
+        if len(len_stats) > 1:
+            print("      ⚠ 長度不一致代表混入不同型別的封包，同一陣列索引在不同幀")
+            print("        會對應到不同的實體子載波，需在韌體端過濾。")
+        modes = {0: "非HT(11b/g)", 1: "HT(11n)", 2: "HT40", 3: "其他"}
+        print(f"  - 封包型別分布：" + "，".join(
+            f"{modes.get(m, m)} {c} 筆" for m, c in sorted(sig_mode_stats.items())))
+    if rssi_samples:
+        print(f"  - RSSI：平均 {sum(rssi_samples) / len(rssi_samples):.1f} dBm "
+              f"(範圍 {min(rssi_samples)} ~ {max(rssi_samples)})")
     print(f"  - 儲存位置：{filename}")
