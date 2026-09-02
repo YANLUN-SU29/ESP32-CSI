@@ -59,32 +59,57 @@ print(f"\n[啟動] Wi-Fi 雷達 (CSV 錄製模式：{ACTION_LABEL} / 動態 COM 
 
 # ----------------- [動態 COM Port 掃描] -----------------
 def get_com_port():
-    ports = serial.tools.list_ports.comports()
-    if not ports:
-        print("[錯誤] 找不到任何 COM Port，請檢查 ESP32 是否已接上 USB。")
+    """挑選 ESP32 所在的序列埠。
+
+    只考慮真正的 USB 裝置（有 VID/PID）：主機板內建的傳統序列埠
+    （COM1，HWID 形如 ACPI\\PNP0501）沒有 VID/PID，且無法設定到 921600 baud，
+    若誤鎖它會在開埠時拋出難以理解的 OSError(22, '參數錯誤')。
+    """
+    ports = list(serial.tools.list_ports.comports())
+    usb_ports = [p for p in ports if p.vid is not None]
+
+    if not usb_ports:
+        print("[錯誤] 找不到任何 USB 序列裝置，ESP32 似乎沒有被系統辨識。")
+        print("       請檢查：")
+        print("         1. USB 線是否支援資料傳輸（純充電線不行）")
+        print("         2. 是否已安裝 USB 轉序列埠驅動（NodeMCU-32S 多為 CP2102 或 CH340）")
+        print("         3. 裝置管理員的「連接埠」或「其他裝置」有無帶驚嘆號的項目")
+        if ports:
+            print("       目前系統上只有這些非 USB 的序列埠（都不是 ESP32）：")
+            for p in ports:
+                print(f"         {p.device} - {p.description}")
         exit()
-    if len(ports) == 1:
-        print(f"[自動] 鎖定唯一設備：{ports[0].device} ({ports[0].description})")
-        return ports[0].device
-    print("\n[掃描] 偵測到多個 COM Port，請選擇你的 ESP32：")
-    for i, port in enumerate(ports):
-        print(f"  [{i}] {port.device} - {port.description}")
+
+    if len(usb_ports) == 1:
+        p = usb_ports[0]
+        print(f"[自動] 鎖定唯一 USB 裝置：{p.device} ({p.description})")
+        return p.device
+
+    print("\n[掃描] 偵測到多個 USB 序列裝置，請選擇你的 ESP32：")
+    for i, p in enumerate(usb_ports):
+        print(f"  [{i}] {p.device} - {p.description}")
     while True:
         try:
-            choice = input("\n請輸入設備號碼 (例如 0): ").strip()
-            idx = int(choice)
-            if 0 <= idx < len(ports):
-                selected_port = ports[idx].device
-                print(f"[選擇] 已選擇：{selected_port}")
-                return selected_port
-            else:
-                print("[錯誤] 號碼超出範圍，請重新輸入。")
+            idx = int(input("\n請輸入設備號碼 (例如 0): ").strip())
+            if 0 <= idx < len(usb_ports):
+                print(f"[選擇] 已選擇：{usb_ports[idx].device}")
+                return usb_ports[idx].device
+            print("[錯誤] 號碼超出範圍，請重新輸入。")
         except ValueError:
             print("[錯誤] 請輸入有效的數字號碼。")
 
 SERIAL_PORT = get_com_port()
 
-# ----------------- [CSV 檔案常駐開啟] -----------------
+# ----------------- [先連硬體，成功後才建立 CSV] -----------------
+# 順序很重要：若先開檔再連線，連線失敗時會留下一堆只有標題列的空 CSV，
+# 之後批次分析會踩到這些空檔。
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+except Exception as e:
+    print(f"[錯誤] 無法連線至 {SERIAL_PORT}: {e}")
+    exit()
+print(f"[連線] 已開啟 {SERIAL_PORT} @ {BAUD_RATE} baud")
+
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -95,12 +120,13 @@ csv_writer.writerow(['Timestamp'] + COLUMN_NAMES)
 
 print(f"[錄製] CSV 輸出路徑：{filename}")
 
-# ----------------- [初始化矩陣與硬體] -----------------
+# ----------------- [初始化矩陣] -----------------
 data_matrix = np.zeros((SUBCARRIERS, WINDOW_SIZE))
 record_count = 0
 error_count = 0
 gap_count = 0
 layout_skip = 0       # 因長度不符預期佈局而丟棄的幀數
+consecutive_errors = 0  # 連續失敗次數，用於偵測序列埠斷線
 last_sample_time = None
 
 # 韌體 CSI_V2 格式帶回的中繼資料統計（用於確認子載波佈局與連線品質）
@@ -108,13 +134,6 @@ len_stats = {}        # 原始 CSI 位元組數 -> 出現次數
 sig_mode_stats = {}   # 0:非HT(11b/g) 1:HT(11n) -> 出現次數
 rssi_samples = []
 meta_reported = False
-
-try:
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-except Exception as e:
-    print(f"[錯誤] 無法連線至 {SERIAL_PORT}: {e}")
-    csv_file.close()
-    exit()
 
 # ----------------- [建立雙層視覺化畫布] -----------------
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [1, 1.5]})
@@ -141,10 +160,19 @@ fig.colorbar(cax, ax=ax2, label="Amplitude Fluctuation")
 # ----------------- [資料更新邏輯] -----------------
 def update(frame):
     global data_matrix, record_count, error_count, gap_count, last_sample_time
-    global meta_reported, layout_skip
+    global meta_reported, layout_skip, consecutive_errors
     updated = False
 
-    while ser.in_waiting > 0:
+    # 序列埠若被拔掉，in_waiting 會直接拋例外，需在迴圈外攔下
+    try:
+        pending = ser.in_waiting
+    except Exception as e:
+        print(f"\n[錯誤] 序列埠連線中斷：{e}")
+        print("       請檢查 USB 是否被拔除，關閉視窗後重新執行。")
+        plt.close(fig)
+        return lines + [cax]
+
+    while pending > 0:
         try:
             raw_data = ser.readline().decode('utf-8').strip()
             if raw_data.startswith("CSI_V2") or raw_data.startswith("CSI_DATA"):
@@ -209,12 +237,28 @@ def update(frame):
                     data_matrix = np.roll(data_matrix, -1, axis=1)
                     data_matrix[:, -1] = selected
                     updated = True
+                    consecutive_errors = 0
         except Exception as e:
             error_count += 1
+            consecutive_errors += 1
             if error_count <= 10:
                 print(f"[警告] 第 {error_count} 筆解析錯誤: {e}")
             elif error_count == 11:
                 print("[警告] 後續錯誤將不再逐筆顯示，結束時統一報告。")
+            # 連續大量失敗且完全沒有成功解析，多半是序列埠斷線或韌體格式不符，
+            # 不再無限重試下去（原本會一直刷錯誤訊息且不會結束）
+            if consecutive_errors >= 500:
+                print(f"\n[錯誤] 連續 {consecutive_errors} 筆解析失敗且無任何成功樣本。")
+                print("       可能原因：USB 被拔除、ESP32 重開機、或韌體輸出格式不符。")
+                plt.close(fig)
+                return lines + [cax]
+
+        try:
+            pending = ser.in_waiting
+        except Exception as e:
+            print(f"\n[錯誤] 序列埠連線中斷：{e}")
+            plt.close(fig)
+            return lines + [cax]
 
     if updated:
         # 更新上方折線圖
