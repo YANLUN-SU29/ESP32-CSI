@@ -84,11 +84,14 @@ void _wifi_csi_cb(void *ctx, wifi_csi_info_t *data) {
 // 行格式：CSI_V3,<seq>,<len>,<rssi>,<sig_mode>,<dropped>,<csi...>
 //   seq     = 事件序號，PC 端比對跳號即知傳輸中遺失了幾行
 //   dropped = ESP32 端累計丟棄數（佇列滿 + 長度異常），讓 PC 端直接看到丟失率
-void drain_csi_queue() {
+// 回傳是否有輸出任何資料，供 loop 決定要不要讓出 CPU
+bool drain_csi_queue() {
   static char line_buf[4096];
   csi_item_t item;
+  bool any = false;
 
   while (xQueueReceive(csi_queue, &item, 0) == pdTRUE) {
+    any = true;
     uint32_t dropped = queue_full_drop + oversize_drop;
     int pos = 0;
     pos += sprintf(line_buf + pos, "CSI_V3,%lu,%u,%d,%u,%lu",
@@ -100,6 +103,7 @@ void drain_csi_queue() {
     }
     Serial.println(line_buf);
   }
+  return any;
 }
 
 
@@ -209,7 +213,7 @@ void loop() {
   // 每輪先盡量排空 CSI 佇列。這是 loop 最重要的工作——排得不夠快佇列就會滿，
   // 進而累加 queue_full_drop。原本的 delay(10) 會讓 loop 有 10ms 完全不排空，
   // 故改用 millis() 排程敲門，不再阻塞。
-  drain_csi_queue();
+  bool drained = drain_csi_queue();
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WiFi] 連線中斷，重新連線...");
@@ -244,6 +248,11 @@ void loop() {
   }
 #endif
 
-  // 讓出 1 tick 給其他任務（含 Wi-Fi 任務），但不長時間阻塞排空工作
-  vTaskDelay(1);
+  // 只在「這輪沒東西可輸出」時才讓出 CPU。
+  // 原本無條件 vTaskDelay(1) 會讓每一行都額外付 1ms：實測樣本間隔中位數
+  // 由 5.00ms 變成 6.00ms、fps 由 85 掉到 76（約 -11%）。
+  // 忙碌時不必讓出，因為 Serial.write 在緩衝區滿時本身就會讓出。
+  if (!drained) {
+    vTaskDelay(1);
+  }
 }

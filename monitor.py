@@ -146,8 +146,18 @@ last_sample_time = None
 
 # 丟失率追蹤（需韌體 CSI_V3 以上）
 last_seq = None         # 上一筆的事件序號
-seq_lost = 0            # 序號跳號累計 = ESP32→PC 之間整行遺失的數量
+seq_lost = 0            # 序號跳號累計
 esp_drop_total = 0      # ESP32 端自報的累計丟棄數（佇列滿 + 長度異常）
+csi_lines = 0           # 完整收到且通過長度校驗的 CSI 行數
+truncated = 0           # 行被截斷（宣告長度與實得不符）
+
+
+class TruncatedLine(Exception):
+    """CSI 行的宣告長度與實得不符（序列埠壅塞造成的截斷）。
+
+    與一般解析錯誤分開計數：後者要留給真正的非 CSI 雜訊行
+    （例如 ESP32 開機時吐出的二進位垃圾），混在一起丟失率的帳就會算錯。
+    """
 
 # 韌體 CSI_V2 格式帶回的中繼資料統計（用於確認子載波佈局與連線品質）
 len_stats = {}        # 原始 CSI 位元組數 -> 出現次數
@@ -181,7 +191,7 @@ fig.colorbar(cax, ax=ax2, label="Amplitude Fluctuation")
 def update(frame):
     global data_matrix, record_count, error_count, gap_count, last_sample_time
     global meta_reported, layout_skip, consecutive_errors
-    global last_seq, seq_lost, esp_drop_total
+    global last_seq, seq_lost, esp_drop_total, csi_lines, truncated
     updated = False
 
     # 序列埠若被拔掉，in_waiting 會直接拋例外，需在迴圈外攔下
@@ -221,13 +231,17 @@ def update(frame):
                     csi_numbers = [int(x) for x in tokens[1:] if x.strip() != ""]
 
                 if declared_len is not None:
-                    # 長度與宣告不符代表該行被截斷（序列埠壅塞），整幀丟棄
+                    # 長度與宣告不符代表該行被截斷（序列埠壅塞）。
+                    # 單獨計數而不併入 error_count——後者要留給真正的非 CSI 雜訊行
+                    # （例如開機時的二進位垃圾），否則丟失率的帳會算錯。
                     if len(csi_numbers) != declared_len:
-                        raise ValueError(
-                            f"CSI 長度不符：宣告 {declared_len}，實得 {len(csi_numbers)}")
+                        raise TruncatedLine(
+                            f"宣告 {declared_len}，實得 {len(csi_numbers)}")
                     len_stats[declared_len] = len_stats.get(declared_len, 0) + 1
                     sig_mode_stats[sig_mode] = sig_mode_stats.get(sig_mode, 0) + 1
                     rssi_samples.append(rssi)
+
+                csi_lines += 1
 
                 if seq is not None:
                     # 序號跳號 = 該行在 ESP32 到 PC 之間整行遺失（過去完全偵測不到）
@@ -287,6 +301,10 @@ def update(frame):
                     data_matrix[:, -1] = amp_selected
                     updated = True
                     consecutive_errors = 0
+        except TruncatedLine:
+            # 資料仍在流動，只是這一行壞了，故不計入連續失敗
+            truncated += 1
+            consecutive_errors = 0
         except Exception as e:
             error_count += 1
             consecutive_errors += 1
@@ -350,24 +368,33 @@ finally:
               f"多為非 HT 封包只含 LLTF）")
 
     # ---- 丟失率（需韌體 CSI_V3 以上）----
+    # 帳務說明：韌體是先 ++csi_seq 才入佇列，所以「佇列滿而被丟棄」的事件
+    # 也已佔用一個序號，會表現為序號跳號。因此序號跳號已涵蓋 ESP32 端的佇列滿丟棄，
+    # 兩者不可再相加（相加會重複計算）。
+    # 長度異常的丟棄則發生在編號之前，不佔序號，只反映在韌體自報的 dropped 內。
     if last_seq is not None:
-        produced = last_seq              # ESP32 端產生的事件總數（序號即計數）
-        got = record_count + error_count + layout_skip
+        numbered = last_seq          # ESP32 已編號的事件總數
         print(f"\n  【丟失率分析】")
-        print(f"  - ESP32 產生事件：{produced} 筆（序號最大值）")
-        print(f"  - ESP32 端丟棄  ：{esp_drop_total} 筆"
-              f"（佇列滿=序列埠追不上，或長度異常）")
-        print(f"  - 傳輸中遺失    ：{seq_lost} 筆（序號跳號）")
-        print(f"  - PC 端收到      ：{got} 筆")
-        total_lost = esp_drop_total + seq_lost
-        if produced > 0:
-            rate = total_lost / (produced + esp_drop_total) * 100
-            print(f"  - 總丟失率      ：{total_lost} 筆 ({rate:.2f}%)")
-            if rate > 5:
-                print("    ⚠ 丟失率偏高。序列埠頻寬是已知瓶頸，可考慮改二進位輸出"
-                      "或提高 baud rate。")
-            elif total_lost == 0:
+        print(f"  - ESP32 已編號事件：{numbered} 筆（序號最大值）")
+        print(f"  - 完整收到        ：{csi_lines} 筆")
+        print(f"  - 行截斷損壞      ：{truncated} 筆")
+        print(f"  - 序號跳號        ：{seq_lost} 筆")
+        # 自我核對：三者相加應等於已編號事件數
+        accounted = csi_lines + truncated + seq_lost
+        mark = "✓ 相符" if accounted == numbered else f"✗ 差 {numbered - accounted}"
+        print(f"  - 核對            ：{csi_lines} + {truncated} + {seq_lost} "
+              f"= {accounted} vs {numbered}  {mark}")
+        print(f"  - 韌體自報丟棄    ：{esp_drop_total} 筆"
+              f"（佇列滿已含在序號跳號內；另含長度異常，該類不佔序號）")
+        lost = seq_lost + truncated
+        if numbered > 0:
+            rate = lost / numbered * 100
+            print(f"  - 總丟失率        ：{lost} 筆 ({rate:.2f}%)")
+            if lost == 0:
                 print("    ✓ 無任何丟失")
+            elif rate > 5:
+                print("    ⚠ 丟失率偏高。若韌體自報丟棄也大於 0，代表佇列排不及，"
+                      "可加大 CSI_QUEUE_LEN 或改二進位輸出降低序列埠負載。")
     else:
         print("\n  【丟失率分析】韌體為舊版格式（無序號），無法計算丟失率")
     if len_stats:
