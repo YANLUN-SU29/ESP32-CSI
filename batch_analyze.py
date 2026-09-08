@@ -295,6 +295,41 @@ def report(rows, band, want_phase):
             print(f"  安全裕度：對照組共識達標者最高 {lo:.1f}，呼吸組陽性最低 {hi:.1f}"
                   f"{f'，間隔 {hi - lo:.1f}' if hi > lo else '（無間隔，門檻偏險）'}")
 
+    # ---- 留一交叉驗證（誠實估計）----
+    if len(G) >= 3 and len(Nr) >= 3:
+        print(f"\n{'=' * 92}\n留一交叉驗證（每折用其餘資料重選門檻，避免樂觀偏誤）\n{'=' * 92}")
+        allr = G + Nr
+        labels = [True] * len(G) + [False] * len(Nr)
+
+        def pick(train, ytr):
+            best = None
+            for th in np.arange(2, 40, 0.5):
+                for cs in (0.7, 0.8, 0.9, 1.0):
+                    t_ = sum(1 for r, y in zip(train, ytr)
+                             if y and r['all']['prom'] >= th and r['all']['consensus'] >= cs)
+                    f_ = sum(1 for r, y in zip(train, ytr)
+                             if not y and r['all']['prom'] >= th and r['all']['consensus'] >= cs)
+                    key = (f_ == 0, t_, -th)
+                    if best is None or key > best[0]:
+                        best = (key, th, cs)
+            return best[1], best[2]
+
+        tp = fp = fn = tn = 0
+        for i in range(len(allr)):
+            tr = [r for j, r in enumerate(allr) if j != i]
+            ytr = [y for j, y in enumerate(labels) if j != i]
+            th, cs = pick(tr, ytr)
+            pred = (allr[i]['all']['prom'] >= th and allr[i]['all']['consensus'] >= cs)
+            if labels[i] and pred: tp += 1
+            elif labels[i]: fn += 1
+            elif pred: fp += 1
+            else: tn += 1
+        acc = (tp + tn) / len(allr)
+        print(f"  正確率 {tp + tn}/{len(allr)} = {acc * 100:.1f}%　"
+              f"敏感度 {tp / max(1, tp + fn) * 100:.1f}%　特異度 {tn / max(1, tn + fp) * 100:.1f}%")
+        print(f"  命中 {tp}/{tp + fn}　漏判 {fn}　誤報 {fp}/{fp + tn}")
+        print("  註：此為誠實估計。上方「現行門檻驗證」是用同一批資料選門檻再評估，會偏樂觀。")
+
     # ---- 門檻掃描建議 ----
     if G and Nr:
         print(f"\n{'=' * 92}\n零誤報門檻掃描\n{'=' * 92}")
