@@ -32,12 +32,23 @@ PLOT_MAX_POINTS = 4000   # 繪圖抽樣上限，避免長檔案拖慢畫面
 TOP_K = 10               # 計算載波共識度時取前幾強的子載波
 CONSENSUS_TOL = 0.02     # Hz；峰值頻率差距在此範圍內視為「同意」
 
-# 判定門檻。以 20 筆呼吸 / 5 筆閉氣 / 5 筆空房間實測資料校準。
-# 主指標採「最佳單一子載波突出度」而非融合訊號突出度：實測前者對
-# 呼吸 vs (無人+閉氣) 的 AUC=1.00（排除 P0 盲區），門檻 20 命中 14/15 且零誤報；
-# 換成融合訊號突出度只命中 9/15。共識度僅作輔助條件，門檻拉到 0.8 會誤殺真呼吸。
-TH_HIGH_PROM, TH_HIGH_CONS = 20.0, 0.70
-TH_MID_PROM = 10.0
+# Welch PSD 的窗長（秒）。窗越短分段越多、平均越充分，代價是頻率解析度變差。
+# 以 2026-09-08 那批 20 筆 110 條格式資料實測掃描：
+#   60s（原設定）→ 約 1~2 段平均，AUC 0.917，空房間出現 24.0 的假峰值
+#   30s          → 約 4 段平均，AUC 0.958，空房間最高降至 5.5
+#   20s 以下     → 解析度 0.05Hz 起跳，呼吸頻段（0.15~0.4Hz）解析不足，命中率反而掉
+# 呼吸率推估穩定度在 30s 與 60s 相同（±0.4 次/分），故取 30s。
+WELCH_WINDOW_SEC = 30
+
+# 判定門檻。以 12 筆呼吸 / 3 筆閉氣 / 5 筆空房間（110 條含相位格式）校準。
+# 主指標採「最佳單一子載波突出度」，共識度為必要輔助條件——本批資料中
+# 空房間曾出現突出度 5.5 但共識度僅 80% 的假峰值，單看突出度無法零誤報。
+# 現行組合命中 11/12、誤報 0/8；對照組中共識度達標者最高僅 3.3，
+# 呼吸組陽性最低 5.9，兩者間有明確間隔。
+#
+# 注意：突出度的數值尺度會隨 WELCH_WINDOW_SEC 改變，兩者必須一起調整。
+TH_HIGH_PROM, TH_HIGH_CONS = 5.5, 0.90
+TH_MID_PROM = 3.5
 
 
 class CSIFeatureViewer:
@@ -211,7 +222,7 @@ class CSIFeatureViewer:
 
             # 各子載波的 PSD 與頻段無關，載入時算一次即可，切換模式就不必重算
             self._stage = "計算頻譜..."
-            nper = int(min(len(clean), fps * 60))
+            nper = int(min(len(clean), fps * WELCH_WINDOW_SEC))
             freqs, _ = welch(clean[:, 0], fs=fps, nperseg=nper, nfft=8192)
             psd = np.empty((len(freqs), clean.shape[1]))
             for j in range(clean.shape[1]):
@@ -358,7 +369,7 @@ class CSIFeatureViewer:
         band, color, title = mode['band'], mode['color'], mode['label']
 
         fused = self._fuse(band)
-        nper = int(min(len(fused), self.fps * 60))
+        nper = int(min(len(fused), self.fps * WELCH_WINDOW_SEC))
         f_fused, p_fused = welch(fused, fs=self.fps, nperseg=nper, nfft=8192)
         stats = self._subcarrier_stats(band)
 
